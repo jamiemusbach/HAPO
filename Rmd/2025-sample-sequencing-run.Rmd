@@ -272,7 +272,8 @@ blast_data <- blast_results %>%
 
 top_hits <- blast_data %>%
   group_by(ASV) %>%
-  slice_max(order_by = perc_id, n = 1, with_ties = T)
+  slice_max(order_by = perc_id, n = 1, with_ties = T) %>%
+  filter(mismatch < 4) # remove ASVs with many mismatches between the ASV and the reference haplotype
 
 ```
 
@@ -292,10 +293,21 @@ How many of the ASVs only match one CR?
 
 ```{r}
 top_hits %>%
+  select(ASV, ref_id, perc_id) %>%
+  unique() %>%
   add_tally(name = "n_CR_seqs") %>%
-  filter(n_CR_seqs > 1)
-
-
+  filter(n_CR_seqs > 1) %>%
+  arrange(ref_id) %>%
+  ggplot(aes(x = ASV, y = perc_id)) +
+  geom_bar(stat = "identity") +
+  facet_grid(cols = vars(ref_id), scales = "free", space = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.95, vjust = 0.5),
+    strip.text = element_text(size = 8)
+  )
+  
+ggsave("pdf_outputs/asvs_to_CR.png", width = 10, height = 4)
 ```
 43 ASVs that supposedly match more than one CR haplotype and 148 ASVs that only match a single CR haplotype.
 
@@ -316,9 +328,33 @@ long_df %>%
   geom_tile() +
   theme_bw() +
   theme(
-    axis.text.x = element_text(size = 8)
+    axis.text.x = element_text(size = 8, angle = 90)
   )
 
 ggsave("pdf_outputs/2025_samples_20260413.png", width = 8, height = 11)
+```
+
+
+### Make a haplotype network using the reference CR
+
+```{r}
+library(ape)
+library(pegas)
+
+```
+```{r}
+dna <- read.dna("../data/Phocoena_CR_sequences_Dryad_040418.fasta", format = "fasta")
+
+haps <- haplotype(dna)
+net <- haploNet(haps)
+
+
+# get plotting coordinates without drawing
+coords <- plot(net, plot = FALSE)
+
+nodes$hap <- rownames(nodes)
+nodes$freq <- attr(net, "freq")
+
+
 ```
 

@@ -1,0 +1,531 @@
+---
+title: "tissue-samples"
+author: "diana baetscher"
+date: "2026-05-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Jamie prepped libraries for 20 tissue samples obtained from the Fairbanks museum, ADFG, stranded animals, other sources?
+
+Because of major differences in band brightness/quality among samples after barcoding, samples were grouped into three libraries according to amplification success (low, med, high), and then gel extracted.
+
+Samples in the "low" group were amplified and barcoded 2x, meaning that the same sample has two unique barcodes and that data for those "low" samples should be combined across barcodes prior to analysis.
+
+I will use the same bioinformatics workflow as I used for the eDNA unless there are issues processing the tissue sample data.
+
+MiSeq run on 2026-05-22 using a 2x300 cycle kit.
+
+```{r load-libraries}
+library(dada2)
+library(tidyverse)
+
+```
+
+```{sh, eval=F}
+# preliminaries to get cutadapt going
+(base) AKCJM140-DB23:20260522_HAPOtissue diana.baetscher$ conda activate cutadaptenv
+
+DATA=/Users/diana.baetscher/git-repos/HAPO/data/20260522_HAPOtissue/rawdata
+
+# below, the first set of () creates an array, containing n elements of the desired trimmed and unique names
+NAMELIST=$(ls ${DATA} | sed 's/e*_L001.*//' | uniq)
+echo "${NAMELIST}"
+
+```
+
+
+```{sh, eval=F}
+# mkdir /trimmed
+
+# cutadapt remove primers
+# unlike in the previous microkit runs, here we have paired-end data that should include both the fwd and reverse primers
+# using the -b (anywhere adapter syntax fixed the issue)
+for i in ${NAMELIST}; do
+	cutadapt --discard-untrimmed -b TACTCCTTGAAAAAGCCCATTGTA -B ATGGTCCTGAAGTAAGAACCAGATG -o trimmed/${i}_R1.fastq.gz -p trimmed/${i}_R2.fastq.gz "$DATA/${i}_L001_R1_001.fastq.gz" "$DATA/${i}_L001_R2_001.fastq.gz" >> cutadapt_out.txt
+	done
+
+
+# then unzip the reads in the /trimmed directory
+pigz -d *gz
+```
+
+
+The cutadapt step looks good. >99% of reads contained adapters (primers) and were retained.
+
+Offhand, it looks like there are no empty files, so we'll proceed with dada2.
+
+
+## Dada2 and ASV analysis
+
+Launching into the R-portion of the analysis in dada2
+
+```{r}
+# file location
+path <- "../data/20260522_HAPOtissue/trimmed"
+
+list.files(path)
+
+```
+```{r}
+# paired-end data
+fnFs <- sort(list.files(path, pattern = "_R1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "_R2.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+```
+
+
+```{r}
+plotQualityProfile(fnFs[1:3])
+plotQualityProfile(fnRs[1:3])
+
+```
+Read 1 look ok, with >Q30 to ~270 bp. 
+Read 2, however, looks much worse (as it typical for 600-cycle kits). Let's try trimming those to 150 bp and see if we still get sufficient overlap.
+
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+
+
+Change truncLen to see how that affects downstream processing.
+```{r}
+# I've changed the trimming parameters because the R2 sequences are poorer quality than the eDNA samples.
+# everything else is kept consistent.
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(270,150),
+              maxN=0, maxEE=c(2,4), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) 
+head(out)
+```
+
+### Error rates
+```{r}
+fwd_list <- as.list(filtFs)
+rev_list <- as.list(filtRs)
+
+new_list <- fwd_list[1:10] # smaller amount of data for learning the error rates.
+new_list2 <- rev_list[1:10]
+
+
+# fwd error rates
+errF <- learnErrors(new_list, multithread=TRUE)
+# reverse error rates
+errR <- learnErrors(new_list2, multithread=TRUE)
+0
+# plot the erors
+p1 <- plotErrors(errF, nominalQ=TRUE)
+p2 <- plotErrors(errR, nominalQ=TRUE)
+
+```
+
+
+### Sample inference
+
+```{r}
+# forwards
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+
+# reverses
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+
+```
+
+Merge paired end reads
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+Make a sequence table
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+```
+
+
+```{r}
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+```
+
+I previously used 401-403 as the sequence length for eDNA. I'll do the same here, but this could be a place to revisit that.
+
+Jamie's diagram has the size at 403 without primers: 
+https://docs.google.com/document/d/1t1Clwnw5agXfJqRAjg6nR_7Q_m0kBddew_41klD5dZQ/edit?tab=t.0
+
+Let's remove the singletons and off-target sequences
+```{r}
+# this seems like the obvious size range
+# but if necessary, we can investigate different filtering options here
+seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% 401:403]
+
+```
+
+Remove chimeras
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+```
+
+I should look again at how chimeras are identified and what the impact is of including/excluding them.
+
+Calculate frequency of chimeras
+```{r}
+sum(seqtab.nochim)/sum(seqtab2)
+
+```
+
+Track reads through the pipeline
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+## Export files for taxonomy and samples/ASVs
+
+```{r regseqs-asv-output}
+ #make fasta file with ASVs
+    asv_seqs=colnames(seqtab.nochim)
+    for(i in 1:length(asv_seqs))
+    {
+        write.table(paste(">ASV",i, sep=""),file="csv_outputs/hapo_20260522_ASV.csv", append=TRUE, col.names = F, row.names = F, quote=F)
+        write.table(paste(asv_seqs[i], sep=""),file="csv_outputs/hapo_20260522_ASV.csv", append=TRUE, col.names = F, row.names = F, quote=F)
+    }
+```
+
+That's the input for the FASTA blastn search.
+
+Make ASV headers correspond to those output in the FASTA file.
+```{r output-asv-table}
+# Make map between brief names and full sequences
+briefToSeq <- colnames(seqtab.nochim)
+names(briefToSeq) <- paste0("ASV", seq(ncol(seqtab.nochim))) # Seq1, Seq2, ...
+# Make new sequence table with brief names
+st.brief <- seqtab.nochim
+colnames(st.brief) <- names(briefToSeq)
+
+# export the pool seq table with brief names:
+write.csv(st.brief, file="csv_outputs/hapo_20260522_sampleTable.csv")
+```
+
+
+### Quick look at ASV results without taxonomy ###
+
+```{r read-in-data-outputs-from-dada2}
+sample_df <- read_csv("csv_outputs/hapo_20260522_sampleTable.csv") %>%
+  dplyr::rename(sample = `...1`)
+
+```
+
+## Sample info
+
+```{r asvs-in-samples}
+#tmp <- as.data.frame(st.brief)
+#sample_df <- rownames_to_column(tmp, var = "sample")
+
+long_df <- sample_df %>%
+  pivot_longer(2:length(sample_df)) %>%
+  dplyr::rename(reads = value, ASV = name) 
+
+# long_df %>%
+#   write_csv("csv_outputs/microkit_samples_20260324.csv")
+
+long_df %>%
+  #filter(reads > 1) %>% # pretty minimal read filter
+  ggplot(aes(x = sample, y = reads, fill = ASV)) +
+  geom_bar(stat = "identity") +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 90, size = 6)
+  ) +
+  scale_y_continuous(expand = c(0,0))
+
+# ggsave("pdf_outputs/microkit_20260324_quicklook.png", width = 10, height = 4)
+```
+
+
+What proportion of the reads are the dominant ASV?
+
+```{r}
+asv_prop_df <- long_df %>%
+  filter(reads > 0) %>%
+  group_by(sample) %>%
+  mutate(total_reads = sum(reads)) %>%
+  mutate(prop_reads = reads/total_reads)
+
+asv_prop_df %>%
+  filter(prop_reads > 0.75) %>%
+  ggplot(aes(x = sample, y = prop_reads, fill = ASV)) +
+  geom_bar(stat = "identity") +
+  theme(
+    #legend.position = "none",
+    axis.text.x = element_text(angle = 90, size = 6)
+  ) +
+  scale_y_continuous(expand = c(0,0))
+
+```
+Easy enough to set a filter that excludes the other haplotypes/ASVs. But, perhaps more significantly, how can we identify the errors and exclude them in a standardized way?
+
+We can drop the sample duplicates because they all match their same dominant haplotype.
+
+```{r}
+asv_prop_df %>%
+  filter(prop_reads > 0.75) %>%
+  filter(!str_detect(sample, "-2")) %>%
+   ggplot(aes(x = sample, y = prop_reads, fill = ASV)) +
+  geom_bar(stat = "identity") +
+  theme(
+    #legend.position = "none",
+    axis.text.x = element_text(angle = 90, size = 6)
+  ) +
+  scale_y_continuous(expand = c(0,0))
+
+```
+all of these ASVs have >90% of reads except one...
+
+
+## Reference "taxonomy"
+
+Can we associate those ASVs with reference control regions?
+
+```{sh, eval=F}
+# using the blastn installation on sedna
+
+# checkout a core
+srun -c 1 -t 01:00:00 --pty /bin/bash
+
+# load the blastn module
+module load bio/blast/2.11.0+
+
+# run blastn
+blastn -db hapo_CR -query /home/dbaetscher/workdir/blast/HAPO_eDNA/hapo_20260522_ASV.csv -out tissue_CR_results.txt -outfmt 6
+
+```
+
+```{r read-in-blastn-output}
+asv_ids <- read_tsv("../data/blast_outputs/tissue_CR_results.txt", col_names = c("ASV", "CR", "perc_id", "length", "mismatch", "gapopen", "qstart", "qend", "sstart", "ssend", "evalue", "bitscore")) %>%
+  unique()
+
+asv_ids
+```
+It's sort of weird that these alignments are offset by 18 bp. I wonder if the reference sequences include the primer region?
+
+I wonder if I could use blastn to evaluate the control regions and their mismatches...
+
+
+```{r dealing-with-duplication-in-the-ASV-to-CR-alignments}
+asv_ids %>%
+  filter(mismatch < 1 &
+           gapopen < 1) %>% # no mismatches
+  unique() %>%
+  ggplot(aes(x = CR, y = ASV)) +
+  geom_tile()
+
+```
+In these cases, the ASVs have different start points, often.
+
+```{r}
+asv_filtered <- asv_ids %>%
+  group_by(ASV) %>%
+  top_n(., n = 1, wt = perc_id) %>% # first select for highest % id
+  top_n(., n = 1, wt = length) %>% # then select for longest query sequence
+  filter( mismatch < 2 &
+           gapopen < 2) %>%
+  unique()
+
+```
+Are the total read counts for some of these ASVs quite low?
+
+
+
+
+
+
+Match up the references with their sample ASVs:
+
+```{r}
+asv_prop_df %>%
+  filter(reads > 1) %>%
+  group_by(ASV) %>%
+  summarise(asv_reads = sum(reads)) %>%
+  arrange(desc(asv_reads)) %>%
+  left_join(., asv_filtered) %>%
+  filter(is.na(CR)) %>%
+  left_join(asv_ids)
+
+
+```
+I'm not surprised that some of the low read depth ASVs have no reference, but I'm quite surprised that ASVs with >100k reads don't match any of the control regions...
+
+```{r look-at-one-example}
+asv_ids %>%
+  filter(mismatch < 5) %>%
+  filter(ASV == "ASV6") %>%
+  filter(mismatch < 2) %>%
+  unique()
+
+asv_ids %>%
+  filter(mismatch < 3) %>%
+  filter(ASV == "ASV8") %>%
+  unique()
+```
+
+So for some of these references, it would appear that the variation among control region haplotypes may be in the primer region??
+
+
+
+
+
+Now zoom in on our dominant haplotypes from the tissue samples:
+```{r}
+asv_prop_df %>%
+  filter(prop_reads > 0.75) %>%
+  filter(!str_detect(sample, "-2")) %>%
+  left_join(., asv_filtered) %>%
+  select(-evalue, -bitscore) %>%
+  unique() %>%
+  #filter(is.na(CR))
+  ggplot(aes(x = sample, y = prop_reads, fill = CR)) +
+  geom_bar(stat = "identity") +
+  theme(
+    #legend.position = "none",
+    axis.text.x = element_text(angle = 90, size = 6)
+  ) +
+  scale_y_continuous(expand = c(0,0))
+  
+```
+There are size samples for which the dominant ASV matched two control region haplotypes at the same percent identity and then there are two samples for which the ASV didn't match any control regions with fewer than 3 mismatches.
+
+It will be worth taking a closer look at the reference sequences, making sure none of them are duplicates, and consulting the additional sequences on NCBI.
+
+```{r}
+# ASV8 is the remaining unknown
+asv_ids %>%
+  filter(ASV == "ASV8") %>%
+  arrange(-perc_id, -length)
+
+```
+CR01 is the best match, but 2 mismatches seems like a lot.
+
+```{r}
+asv_filtered %>%
+  filter(ASV == "ASV1")
+```
+
+```{r}
+asv_prop_df %>%
+  filter(prop_reads > 0.75) %>%
+  filter(!str_detect(sample, "-2")) %>%
+  left_join(., asv_filtered) %>%
+  select(-evalue, -bitscore) %>%
+  unique() %>%
+  group_by(sample) %>%
+  tally() %>%
+  filter(n == 2) %>%
+  left_join(., asv_prop_df) %>%
+  left_join(., asv_filtered) %>%
+  filter(prop_reads > 0.8) %>%
+  select(-evalue, -bitscore, -n, -total_reads, -reads, -prop_reads)
+
+```
+
+1) Why do these all start at 18 bp in the reference?
+2) We selected 401-403 bp fragments in dada2... why are the alignments 379 bp?
+
+```{r}
+asv_prop_df %>%
+  filter(prop_reads > 0.02) %>%
+  filter(!str_detect(sample, "-2")) %>%
+  filter(sample != "EB") %>%
+  left_join(., asv_filtered) %>%
+  # group_by(sample, CR) %>%
+  # tally() %>%
+  # group_by(sample) %>%
+  # tally() %>%
+  # arrange(desc(n))
+  ggplot(aes(x = sample, y = prop_reads, fill = CR)) +
+  geom_bar(stat = "identity") +
+  theme(
+    #legend.position = "none",
+    axis.text.x = element_text(angle = 90, size = 6)
+  ) +
+  scale_y_continuous(expand = c(0,0))
+
+
+```
+
+Using Kim's filtering method of looking at the second most common ASV that doesn't match the same control region as the dominant haplotype:
+
+```{r}
+top_cr <- asv_prop_df %>%
+  left_join(., asv_filtered) %>%
+  group_by(sample, CR) %>%
+  summarise(cr_reads = sum(reads)) %>%
+  group_by(sample) %>%
+  mutate(cr_prop = cr_reads/sum(cr_reads)) %>%
+  slice_max(., cr_prop)
+ 
+not_top <- asv_prop_df %>%
+  left_join(., asv_filtered) %>%
+  group_by(sample, CR) %>%
+  summarise(cr_reads = sum(reads)) %>%
+  group_by(sample) %>%
+  mutate(cr_prop = cr_reads/sum(cr_reads)) %>%
+  anti_join(., top_cr) %>% # after removing the top cr, look at the next highest prop
+  ungroup()
+
+not_top %>%
+  group_by(sample) %>%
+  top_n(., n = 1, wt = cr_prop) %>%
+  mutate(perc = cr_prop * 100) %>%
+  arrange(desc(perc))
+
+  
+
+
+```
+
+```{r}
+asv_prop_df %>%
+  left_join(., asv_filtered) %>%
+  group_by(sample, CR) %>%
+  summarise(cr_reads = sum(reads)) %>%
+  group_by(sample) %>%
+  mutate(cr_prop = cr_reads/sum(cr_reads)) %>%
+  filter(cr_prop > 0.075) %>%
+  ggplot(aes(x = sample, y = cr_prop, fill = CR)) +
+  geom_bar(stat = "identity") +
+  theme(
+    #legend.position = "none",
+    axis.text.x = element_text(angle = 90, size = 6)
+  ) +
+  scale_y_continuous(expand = c(0,0))
+
+
+```
+
+```{r}
+asv_prop_df %>%
+  filter(prop_reads > 0.75) %>%
+  filter(sample == "144613") %>%
+  left_join(., asv_filtered)
+```
+
