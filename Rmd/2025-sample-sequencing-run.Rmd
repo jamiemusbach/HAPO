@@ -197,13 +197,13 @@ head(track)
 ## Export files for taxonomy and samples/ASVs
 
 ```{r regseqs-asv-output}
- #make fasta file with ASVs
-    asv_seqs=colnames(seqtab.nochim)
-    for(i in 1:length(asv_seqs))
-    {
-        write.table(paste(">ASV",i, sep=""),file="csv_outputs/hapo_20260413_ASV.csv", append=TRUE, col.names = F, row.names = F, quote=F)
-        write.table(paste(asv_seqs[i], sep=""),file="csv_outputs/hapo_20260413_ASV.csv", append=TRUE, col.names = F, row.names = F, quote=F)
-    }
+ # #make fasta file with ASVs
+ #    asv_seqs=colnames(seqtab.nochim)
+ #    for(i in 1:length(asv_seqs))
+ #    {
+ #        write.table(paste(">ASV",i, sep=""),file="csv_outputs/hapo_20260413_ASV.csv", append=TRUE, col.names = F, row.names = F, quote=F)
+ #        write.table(paste(asv_seqs[i], sep=""),file="csv_outputs/hapo_20260413_ASV.csv", append=TRUE, col.names = F, row.names = F, quote=F)
+ #    }
 ```
 
 That's the input for the FASTA blastn search.
@@ -220,6 +220,11 @@ colnames(st.brief) <- names(briefToSeq)
 # export the pool seq table with brief names:
 write.csv(st.brief, file="csv_outputs/hapo_20260413_sampleTable.csv")
 ```
+
+
+####################
+STOP!!! DO NOT USE THE BELOW CODE! 
+IT HAS BEEN SUPERCEDED BY THE RMD DOC: `2025-eDNA-sample-analysis.Rmd`
 
 
 ### JAMIE BEGIN HERE ###
@@ -266,6 +271,8 @@ blastn -db hapo_CR -query /home/dbaetscher/workdir/blast/HAPO_eDNA/hapo_20260413
 
 
 ```{r read-in-the-custom-blast-results}
+# read in results
+# if the same ASV matches at multiple lengths, select the longest (379 bp)
 blast_results <- read_tsv("../data/blast_outputs/CR_2025_results.txt", col_names = F) 
 blast_data <- blast_results %>%
   dplyr::rename(ASV = X1, ref_id = X2, perc_id = X3, len = X4, mismatch = X5, gap = X6)
@@ -273,8 +280,36 @@ blast_data <- blast_results %>%
 top_hits <- blast_data %>%
   group_by(ASV) %>%
   slice_max(order_by = perc_id, n = 1, with_ties = T) %>%
-  filter(mismatch < 4) # remove ASVs with many mismatches between the ASV and the reference haplotype
+  slice_max(order_by = len, n = 1, with_ties = T) %>% # take just the longest of identical hits
+  mutate(ref_id = ifelse(mismatch > 4, NA, ref_id)) %>% # if the CR matches an ASV with many mismatches, that might be indicative of a novel haplotype.
+  unique() # get rid of duplicates introduced by switching high mismatches matches to NAs
 
+```
+Seems like the mismatches up in the 30s are probably not anything worth including.
+
+```{r}
+# now I might need to filter the other direction... i.e., these are the top hits for ASVs, but 
+# what about collapsing duplicate ASVs if they match a single CR with identical specs? 
+unique_asv_hits <- top_hits %>%
+  arrange(ref_id) %>%
+  ungroup() %>%
+  select(-ASV) %>%
+  unique() 
+
+# stick with a strict length filter for now
+na_crs <- unique_asv_hits %>%
+  filter(is.na(ref_id)) %>%
+  filter(len == 379)
+
+# just working with the hits to existing CR
+hits_to_existing_crs <- unique_asv_hits %>%
+  filter(!is.na(ref_id)) %>%
+  group_by(ref_id) %>%
+  slice_max(order_by = perc_id, n = 1, with_ties = T) %>%
+  slice_max(order_by = len, n = 1, with_ties = T)
+
+tent_hap_df <- hits_to_existing_crs %>%
+  bind_rows(na_crs)
 ```
 
 
@@ -334,27 +369,172 @@ long_df %>%
 ggsave("pdf_outputs/2025_samples_20260413.png", width = 8, height = 11)
 ```
 
+## Adding analysis after learning filtering options from the tissue samples ##
 
-### Make a haplotype network using the reference CR
+
 
 ```{r}
-library(ape)
-library(pegas)
+# ASVs matching with different lengths will be throwing this off
+long_df %>%
+  left_join(., top_hits) %>%
+  filter(len == 379) %>% # standardize length
+  filter(perc_id == 100) %>%
+  # excluding samples, how many ASVs match CRs?
+  select(ASV, ref_id, perc_id, mismatch) %>%
+  unique() %>%
+  ggplot(aes(x = ref_id, y = ASV, fill = perc_id)) +
+  geom_tile() +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 8, angle = 90)
+  )
+  
+```
+
+
+It still seems questionable that so many ASVs match the same CR, even with the 100% seq identity and length filters, but I guess that happens typically in taxonomic assignment... 
+
+
+```{r add-metadata}
+meta <- read_csv("../data/Metadata_extraction_db_format.csv")
+
 
 ```
+
+
+First, ignore the ASVs that don't match any of the control region sequences
 ```{r}
-dna <- read.dna("../data/Phocoena_CR_sequences_Dryad_040418.fasta", format = "fasta")
+  # if the ASV is the only distinguishing variable, remove that and see how it collapses?
+edna_cr_df <- long_df %>%
+  left_join(., top_hits) %>%
+  filter(len == 379) %>% # standardize length
+  filter(perc_id == 100) %>%
+  select(sample, reads, ref_id) %>%
+  #select(-sample, -reads) %>%
+  unique() %>%
+  arrange(ref_id) %>%
+  unique() %>%
+  filter(reads > 0) %>%
+  separate(sample, into = c("sample_id", "replicate"), remove = F) %>%
+  left_join(., meta, by = c("sample_id" = "extraction_ID"))
 
-haps <- haplotype(dna)
-net <- haploNet(haps)
-
-
-# get plotting coordinates without drawing
-coords <- plot(net, plot = FALSE)
-
-nodes$hap <- rownames(nodes)
-nodes$freq <- attr(net, "freq")
-
+edna_cr_df %>%
+  ggplot(aes(x = sample_id, y = reads, fill = ref_id)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sample_type), space = "free", scales = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    strip.text = element_text(size = 6)
+  )
 
 ```
+
+Look at samples, but using more refined haplotype/ASV filters, with NAs to existing haplotypes.
+```{r}
+tmp <- long_df %>%
+  left_join(., top_hits) %>%
+  arrange(ref_id) %>%
+  ungroup() %>%
+  select(-ASV) %>%
+  unique() %>%
+  filter(reads > 0)
+
+# stick with a strict length filter for now
+na_crs <- tmp %>%
+  filter(is.na(ref_id)) %>%
+  filter(len == 379)
+
+# just working with the hits to existing CR
+hits_to_existing_crs <- tmp %>%
+  filter(!is.na(ref_id)) %>%
+  group_by(ref_id) %>%
+  slice_max(order_by = perc_id, n = 1, with_ties = T) %>%
+  slice_max(order_by = len, n = 1, with_ties = T)
+
+tent_hap_df <- hits_to_existing_crs %>%
+  bind_rows(na_crs)
+
+edna_hap_df <- tent_hap_df %>%
+  select(sample, reads, ref_id) %>%
+  #select(-sample, -reads) %>%
+  unique() %>%
+  arrange(ref_id) %>%
+  unique() %>%
+  separate(sample, into = c("sample_id", "replicate"), remove = F) %>%
+  left_join(., meta, by = c("sample_id" = "extraction_ID")) 
+
+
+edna_hap_df %>%
+  ggplot(aes(x = alternative_ID, y = reads, fill = ref_id)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sample_type), space = "free", scales = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    strip.text = element_text(size = 6)
+  )
+```
+
+We haven't done any read depth or sample filters at this point.
+
+One thing to consider: which samples have too few sequencing reads to be confident in haplotype calls?
+
+We'll lean on our controls for threshold filtering for that purpose.
+
+```{r}
+# how many sequencing reads went to NA haplotypes?
+edna_hap_df %>%
+  filter(is.na(ref_id)) %>%
+  ggplot(aes(x = alternative_ID, y = reads, fill = ref_id)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sample_type), space = "free", scales = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    strip.text = element_text(size = 6)
+  )
+  
+```
+
+relatively small number of reads overall... probably not new haplotypes.
+
+Ok, moving on from there - 
+How many reads in the field blanks, seawater blanks and controls overall?
+```{r}
+# reads in the negative control?
+edna_hap_df %>%
+  filter(sample_id == "NC") %>%
+  ggplot(aes(x = sample_id, y = reads, fill = ref_id)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sample_type), space = "free", scales = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    strip.text = element_text(size = 6)
+  )
+
+```
+Basically nothing in the negative controls - 3 reads and 5 reads from CR01.
+
+
+```{r}
+edna_hap_df %>%
+  filter(sample_type != "sample") %>%
+  ggplot(aes(x = sample_id, y = reads, fill = ref_id)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sample_type), space = "free", scales = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    strip.text = element_text(size = 6)
+  )
+
+```
+
+Seems like subtracting 250 reads of CR01 from every sample could be worthwhile, although probably not strictly going to change interpretation because still overall low read numbers.
+
+What is relevant is that any sample with < 500 reads, probably can't be trusted.
+
+
 

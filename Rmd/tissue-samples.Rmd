@@ -227,6 +227,9 @@ write.csv(st.brief, file="csv_outputs/hapo_20260522_sampleTable.csv")
 ```
 
 
+####################
+
+
 ### Quick look at ASV results without taxonomy ###
 
 ```{r read-in-data-outputs-from-dada2}
@@ -243,7 +246,8 @@ sample_df <- read_csv("csv_outputs/hapo_20260522_sampleTable.csv") %>%
 
 long_df <- sample_df %>%
   pivot_longer(2:length(sample_df)) %>%
-  dplyr::rename(reads = value, ASV = name) 
+  dplyr::rename(reads = value, ASV = name) %>%
+  filter(reads > 0)
 
 # long_df %>%
 #   write_csv("csv_outputs/microkit_samples_20260324.csv")
@@ -266,7 +270,6 @@ What proportion of the reads are the dominant ASV?
 
 ```{r}
 asv_prop_df <- long_df %>%
-  filter(reads > 0) %>%
   group_by(sample) %>%
   mutate(total_reads = sum(reads)) %>%
   mutate(prop_reads = reads/total_reads)
@@ -331,6 +334,7 @@ It's sort of weird that these alignments are offset by 18 bp. I wonder if the re
 I wonder if I could use blastn to evaluate the control regions and their mismatches...
 
 
+
 ```{r dealing-with-duplication-in-the-ASV-to-CR-alignments}
 asv_ids %>%
   filter(mismatch < 1 &
@@ -345,15 +349,33 @@ In these cases, the ASVs have different start points, often.
 ```{r}
 asv_filtered <- asv_ids %>%
   group_by(ASV) %>%
-  top_n(., n = 1, wt = perc_id) %>% # first select for highest % id
-  top_n(., n = 1, wt = length) %>% # then select for longest query sequence
-  filter( mismatch < 2 &
-           gapopen < 2) %>%
+  slice_max(order_by = perc_id, n = 1, with_ties = T) %>%
+  slice_max(order_by = length, n = 1, with_ties = T) %>% # take just the longest of identical hits
+  mutate(CR = ifelse(mismatch > 4, NA, CR)) %>% # if the CR matches an ASV with many mismatches, that might be indicative of a novel haplotype.
+  unique() # get rid of duplicates introduced by switching high mismatches matches to NAs
+
+
+```
+
+There are two groups from here:
+1) ASVs that match reference CR haplotypes at 100% identity and length
+2) ASVs that don't match perfectly.
+
+For each ASV, assign to either group.
+
+```{r evaluate-asvs-with-haplotypes}
+# which ASVs match at 100% identity
+cr_hits <- asv_filtered %>%
+  filter(perc_id == 100)
+
+# which ASVs match at <100% identity?
+asv_assignments <- asv_filtered %>%
+  mutate(CR = ifelse(perc_id < 100, NA, CR)) %>%
+  select(ASV, CR) %>%
+  ungroup() %>%
   unique()
 
 ```
-Are the total read counts for some of these ASVs quite low?
-
 
 
 
@@ -367,13 +389,13 @@ asv_prop_df %>%
   group_by(ASV) %>%
   summarise(asv_reads = sum(reads)) %>%
   arrange(desc(asv_reads)) %>%
-  left_join(., asv_filtered) %>%
-  filter(is.na(CR)) %>%
+  left_join(., cr_hits) %>%
+  filter(is.na(CR)) %>% # just looking at NAs
   left_join(asv_ids)
 
 
 ```
-I'm not surprised that some of the low read depth ASVs have no reference, but I'm quite surprised that ASVs with >100k reads don't match any of the control regions...
+I'm not surprised that some of the low read depth ASVs have no reference.
 
 ```{r look-at-one-example}
 asv_ids %>%
@@ -392,27 +414,75 @@ So for some of these references, it would appear that the variation among contro
 
 
 
-
-
 Now zoom in on our dominant haplotypes from the tissue samples:
 ```{r}
 asv_prop_df %>%
   filter(prop_reads > 0.75) %>%
   filter(!str_detect(sample, "-2")) %>%
-  left_join(., asv_filtered) %>%
+  left_join(., cr_hits) %>%
   select(-evalue, -bitscore) %>%
   unique() %>%
   #filter(is.na(CR))
   ggplot(aes(x = sample, y = prop_reads, fill = CR)) +
   geom_bar(stat = "identity") +
+  theme_bw() +
   theme(
     #legend.position = "none",
     axis.text.x = element_text(angle = 90, size = 6)
   ) +
-  scale_y_continuous(expand = c(0,0))
+  scale_y_continuous(expand = c(0,0)) +
+  labs(
+    title = "tissue samples, 100% matches to CR haplotypes"
+  )
   
+ggsave("pdf_outputs/tissue_CR_100perc_matches.png", width = 8, height = 5)
 ```
 There are size samples for which the dominant ASV matched two control region haplotypes at the same percent identity and then there are two samples for which the ASV didn't match any control regions with fewer than 3 mismatches.
+
+What was the original ASV matches for those four samples/ASVs?
+```{r}
+asv_prop_df %>%
+  filter(sample %in% c("144613", "2021167", "2022037", "2025118")) %>%
+  filter(prop_reads > 0.75) %>%
+  left_join(., asv_filtered) %>%
+  select(ASV, CR, perc_id, length, mismatch, prop_reads) %>%
+  unique() %>%
+  ungroup() %>%
+  ggplot(aes(x = sample, y = prop_reads, fill = ASV)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(
+    #legend.position = "none",
+    axis.text.x = element_text(angle = 90, size = 6)
+  ) +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(
+    title = "tissue samples, unassigned to CR haplotypes"
+  )
+
+ggsave("pdf_outputs/tissue_unassigned_ASVs.png", width = 5, height = 3)
+```
+mostly 1-2 mismatches, plus some weirdness to investigate in Geneious.
+```{r extract-fasta-seqs}
+library(Biostrings)
+
+seqs <- readDNAStringSet("csv_outputs/hapo_20260522_ASV.csv", format = "fasta")
+
+# Convert to tibble
+fasta_tbl <- tibble(
+  id = names(seqs),
+  sequence = as.character(seqs)
+)
+
+# the ASVs of interest:
+fasta_tbl %>%
+  filter(id %in% c("ASV11", "ASV6", "ASV9", "ASV8")) %>%
+  unique() %>%
+  write_csv("csv_outputs/tissue_ASVs_wo_haps.csv")
+
+```
+
+
 
 It will be worth taking a closer look at the reference sequences, making sure none of them are duplicates, and consulting the additional sequences on NCBI.
 
@@ -528,4 +598,33 @@ asv_prop_df %>%
   filter(sample == "144613") %>%
   left_join(., asv_filtered)
 ```
+
+Can I output the sequence for ASV6 and then align it to CR05 and CR46?
+
+```{r}
+asv_seqs <- read_csv("csv_outputs/hapo_20260522_ASV.csv", col_names = F) 
+
+library(Biostrings)
+
+# Read FASTA
+seqs <- readDNAStringSet("csv_outputs/hapo_20260522_ASV.csv")
+
+# Convert to data frame
+df <- data.frame(
+  ASV = names(seqs),
+  Sequence = as.character(seqs),
+  stringsAsFactors = FALSE
+)
+  
+df %>%
+  filter(ASV == "ASV6") %>%
+  write_csv("csv_outputs/asv6_test.csv")
+
+```
+
+```{r}
+asv_seqs
+```
+
+Looks like ASV6 might correspond to a new, previously unsampled haplotype?
 

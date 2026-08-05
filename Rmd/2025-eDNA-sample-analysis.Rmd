@@ -1,0 +1,398 @@
+---
+title: "2025-eDNA-sample-analysis"
+author: "diana baetscher"
+date: "2026-08-04"
+output: html_document
+---
+
+Beginning with outputs from dada2 (ASV and sample read table) and blastn (custom reference database with CR haplotypes).
+
+Previous processing steps are in `2025-sample-sequencing-run.Rmd`
+
+```{r}
+library(tidyverse)
+
+# metadata
+meta <- read_csv("../data/Metadata_extraction_db_format.csv")
+```
+
+
+
+```{r read-in-data-outputs-from-dada2}
+sample_df <- read_csv("csv_outputs/hapo_20260413_sampleTable.csv") %>%
+  dplyr::rename(sample = `...1`)
+
+```
+
+## Sample info
+
+```{r asvs-in-samples}
+#tmp <- as.data.frame(st.brief)
+#sample_df <- rownames_to_column(tmp, var = "sample")
+
+long_df <- sample_df %>%
+  pivot_longer(2:length(sample_df)) %>%
+  dplyr::rename(reads = value, ASV = name) %>%
+  filter(reads > 0)
+
+# long_df %>%
+#   write_csv("csv_outputs/microkit_samples_20260324.csv")
+
+long_df %>%
+  filter(reads > 1) %>% # pretty minimal read filter
+  ggplot(aes(x = sample, y = reads, fill = ASV)) +
+  geom_bar(stat = "identity") +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 90, size = 6)
+  ) +
+  scale_y_continuous(expand = c(0,0))
+
+```
+
+Use the custom blast database on Sedna to assign haplotypes for these data.
+
+This was a little clunky for some reason...
+```{sh, eval=F}
+blastn -db hapo_CR -query /home/dbaetscher/workdir/blast/HAPO_eDNA/hapo_20260413_ASV.csv -out CR_2025_results.txt -outfmt 6
+
+```
+
+
+```{r read-in-the-custom-blast-results}
+# read in results
+# if the same ASV matches at multiple lengths, select the longest (379 bp)
+blast_results <- read_tsv("../data/blast_outputs/CR_2025_results.txt", col_names = F) 
+blast_data <- blast_results %>%
+  dplyr::rename(ASV = X1, ref_id = X2, perc_id = X3, len = X4, mismatch = X5, gap = X6)
+
+top_hits <- blast_data %>%
+  group_by(ASV) %>%
+  slice_max(order_by = perc_id, n = 1, with_ties = T) %>%
+  slice_max(order_by = len, n = 1, with_ties = T) %>% # take just the longest of identical hits
+  mutate(ref_id = ifelse(mismatch > 4, NA, ref_id)) %>% # if the CR matches an ASV with many mismatches, that might be indicative of a novel haplotype.
+  unique() # get rid of duplicates introduced by switching high mismatches matches to NAs
+
+```
+
+There are two groups from here:
+1) ASVs that match reference CR haplotypes at 100% identity and length
+2) ASVs that don't match perfectly.
+
+For each ASV, assign to either group.
+
+```{r evaluate-asvs-with-haplotypes}
+# which ASVs match at 100% identity
+cr_hits <- top_hits %>%
+  filter(perc_id == 100)
+
+# which ASVs match at <100% identity?
+asv_assignments <- top_hits %>%
+  mutate(ref_id = ifelse(perc_id < 100, NA, ref_id)) %>%
+  select(ASV, ref_id) %>%
+  ungroup() %>%
+  unique()
+
+```
+
+```{r color-palette}
+library(ggsci)
+
+pal21 <- pal_d3("category20")(14)
+#pal21 <- c(pal21, "#000000")  # add a 21st color
+```
+
+
+```{r join-asvs-to-sample-dataframe}
+edna_unfiltered_df <- long_df %>%
+  left_join(., asv_assignments) %>%
+  separate(sample, into = c("sample_id", "replicate"), remove = F) %>%
+  left_join(., meta, by = c("sample_id" = "extraction_ID")) %>%
+  unite(col = "asv_cr", 4,6, remove = F) 
+
+edna_unfiltered_df %>%
+  ggplot(aes(x = alternative_ID, y = reads, fill = ref_id)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sample_type), space = "free", scales = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 8, angle = 90)
+  ) +
+  scale_fill_manual(values = pal21,  na.value = "grey90") +
+  labs(
+        title = "2025 eDNA samples, unfiltered\nCR with 100% matches"
+  )
+  
+ggsave("pdf_outputs/2025_samples_CR_by_sampletype.png", width = 13, height = 5)
+```
+Only haplotypes that match at 100% identity.
+
+
+Calculate read proportions and use Kim's threshold of 20% of reads per eDNA sample to include/exclude haplotypes.
+
+```{r}
+# look at 20% of reads in each replicate
+edna_unfiltered_df %>%
+  filter(sample_type == "sample") %>%
+  group_by(sample) %>%
+  mutate(read_prop = reads/sum(reads)) %>%
+  unite(col = "sampling_loc", c(latitude, longitude)) %>%
+  ggplot(aes(x = alternative_ID, y = read_prop, fill = ref_id)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sampling_loc), scales = "free", space = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.9, vjust = 0.5),
+    axis.title.y = element_text(margin = margin(r = 5)),
+    axis.title.x = element_text(margin = margin(t = 5)),
+    strip.text = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    y = "proportion of sequencing reads",
+    x = "sample replictes",
+    fill = "haplotype",
+    title = "2025 eDNA samples, unfiltered\nCR with 100% matches"
+  ) +
+    scale_fill_manual(values = pal21, na.value = "grey90") +
+  scale_y_continuous(expand = c(0,0))
+
+ggsave("pdf_outputs/2025_samples_proportions.png", width = 10, height = 5)
+```
+Sample filtering:
+1) remove samples with <1000 reads
+```{r}
+edna_min_depth <- edna_unfiltered_df %>%
+  filter(sample_type == "sample") %>%
+  group_by(sample) %>%
+  mutate(read_prop = reads/sum(reads)) %>%
+  unite(col = "sampling_loc", c(latitude, longitude)) %>%
+  filter(sum(reads) > 1000) # 1000 read depth filter per sample
+
+# take a look:
+edna_min_depth %>%
+  ggplot(aes(x = alternative_ID, y = read_prop, fill = ref_id)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sampling_loc), scales = "free", space = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.9, vjust = 0.5),
+    axis.title.y = element_text(margin = margin(r = 5)),
+    axis.title.x = element_text(margin = margin(t = 5)),
+    strip.text = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    y = "proportion of sequencing reads",
+    x = "sample replictes",
+    fill = "haplotype",
+    title = "2025 eDNA samples, replicates > 1000 reads\nCR with 100% matches"
+  ) +
+    scale_fill_manual(values = pal21, na.value = "grey90") +
+  scale_y_continuous(expand = c(0,0))
+
+ggsave("pdf_outputs/2025_samples_proportions_min_depth.png", width = 10, height = 5)
+```
+
+
+Ok, from there, let's use Kim Parsons's 20% read depth filter - just a coarse look:
+
+```{r 20%-read-depth-filter}
+edna_min_depth %>%
+  filter(read_prop > 0.2) %>%
+  ggplot(aes(x = alternative_ID, y = read_prop, fill = ref_id)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sampling_loc), scales = "free", space = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.9, vjust = 0.5),
+    axis.title.y = element_text(margin = margin(r = 5)),
+    axis.title.x = element_text(margin = margin(t = 5)),
+    strip.text = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    y = "proportion of sequencing reads",
+    x = "sample replictes",
+    fill = "haplotype",
+    title = "2025 eDNA samples, replicates > 1000 reads\nCR with 100% matches, ASVs with 20% of reads"
+  ) +
+    scale_fill_manual(values = pal21, na.value = "grey90") +
+  scale_y_continuous(expand = c(0,0))
+
+
+ggsave("pdf_outputs/2025_samples_proportions_min_depth_20perc.png", width = 10, height = 5)
+```
+
+
+Based on that stringent filter, take a look at unassigned ASVs as potential novel haplotypes.
+```{r}
+edna_min_depth %>%
+  filter(read_prop > 0.2) %>%
+  filter(is.na(ref_id)) %>%
+  ggplot(aes(x = alternative_ID, y = read_prop, fill = ASV)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sampling_loc), scales = "free", space = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.9, vjust = 0.5),
+    axis.title.y = element_text(margin = margin(r = 5)),
+    axis.title.x = element_text(margin = margin(t = 5)),
+    strip.text = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    y = "proportion of sequencing reads",
+    x = "sample replictes",
+    fill = "ASV",
+    title = "2025 eDNA unmatched ASVs, replicates > 1000 reads\nCR with 100% matches, ASVs with 20% of reads"
+  ) +
+    scale_fill_manual(values = pal21, na.value = "grey90") +
+  scale_y_continuous(expand = c(0,0))
+  
+ggsave("pdf_outputs/2025_samples_unassigned_ASVs_20perc.png", width = 6, height = 5)
+
+```
+
+Great. There are five ASV sequences to explore in more detail, i.e., how closely do they match existing haplotypes vs. how many mismatches?
+
+First, looking back at the blastn results
+```{r}
+top_hits %>%
+  filter(ASV %in% c("ASV12", "ASV5", "ASV56", "ASV65")) %>%
+  arrange(ASV)
+
+```
+Each of these ASVs has 1 or 2 mismatches with at least one existing haplotype.
+
+
+I should look at these in Geneious. 
+```{r}
+library(Biostrings)
+
+seqs <- readDNAStringSet("csv_outputs/hapo_20260413_ASV.csv", format = "fasta")
+
+# Convert to tibble
+fasta_tbl <- tibble(
+  id = names(seqs),
+  sequence = as.character(seqs)
+)
+
+# the ASVs of interest:
+fasta_tbl %>%
+  filter(id %in% c("ASV12", "ASV5", "ASV56", "ASV65")) %>%
+  unique() %>%
+  write_csv("csv_outputs/ASVs_wo_haps_20perc.csv")
+
+```
+
+
+Verifying the sequences and their alignments to the reference haplotypes in Geneious, it's clear that they are distinct. And given that 1-base mismatches separate a number of these haplotypes, it seems reasonable that we could designate these as novel.
+
+
+```{r}
+edna_min_depth %>%
+  filter(read_prop > 0.2) %>%
+  #filter(is.na(ref_id)) %>%
+  mutate(haplo = ifelse(is.na(ref_id), ASV, ref_id)) %>%
+   ggplot(aes(x = alternative_ID, y = read_prop, fill = reorder(haplo, -read_prop))) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sampling_loc), scales = "free", space = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.9, vjust = 0.5),
+    axis.title.y = element_text(margin = margin(r = 5)),
+    axis.title.x = element_text(margin = margin(t = 5)),
+    strip.text = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    y = "proportion of sequencing reads",
+    x = "sample replictes",
+    fill = "haplotype",
+    title = "2025 eDNA samples, replicates > 1000 reads\nCR with 100% matches, ASVs with 20% of reads"
+  ) +
+    scale_fill_manual(values = pal21, na.value = "grey90") +
+  scale_y_continuous(expand = c(0,0))
+  
+ggsave("pdf_outputs/2025_samples_all_haplos_20perc.png", width = 10, height = 5)
+```
+
+ASV12 and ASV65 have 5 mismatches between the two sequences, suggesting that they are independent haplotypes not caused by amplification or sequencing errors.
+
+ASV5 and ASV56 have 1 mismatch between them: a G-A SNP at position 372.
+
+
+Look at frequency of occurrence:
+
+```{r freq-of-occurrence}
+reps_per_sample <- edna_min_depth %>%
+  filter(read_prop > 0.2) %>%
+  mutate(haplo = ifelse(is.na(ref_id), ASV, ref_id)) %>%
+  # how many replicates passing filter per sampling loc?
+  group_by(sampling_loc, replicate) %>%
+  tally() %>%
+  group_by(sampling_loc) %>%
+  summarise(n_reps = sum(n))
+
+edna_min_depth %>%
+  filter(read_prop > 0.2) %>%
+  mutate(haplo = ifelse(is.na(ref_id), ASV, ref_id)) %>%
+  group_by(sampling_loc, haplo) %>%
+  add_tally(name = "n") %>%
+  left_join(., reps_per_sample) %>% # calculated how many PCR reps post-filtering per sampling location
+  mutate(freq_occ = n/n_reps) %>% # out of 6 possible PCR replicates, but we didn't get all six for all samples
+  ggplot(aes(x = sampling_loc, y = reorder(haplo, -freq_occ), fill = freq_occ)) +
+  geom_tile() +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.9, vjust = 0.5),
+    axis.title.y = element_text(margin = margin(r = 5)),
+    axis.title.x = element_text(margin = margin(t = 5))
+  ) +
+  scale_fill_viridis_c(option = "viridis") +
+  labs(
+    y = "eDNA haplotypes",
+    x = "sampling location",
+    fill = "frequency of\n occurrence",
+    title = "2025 eDNA samples, 20% read depth filter"
+  )
+
+ggsave("pdf_outputs/2025_samples_freq_occur_20perc.png", width = 6, height = 4.5)
+```
+
+
+Overall frequency in the 2025 samples:
+
+```{r}
+edna_min_depth %>%
+  filter(read_prop > 0.2) %>%
+  mutate(haplo = ifelse(is.na(ref_id), ASV, ref_id)) %>%
+  ungroup() %>%
+  select(sampling_loc, haplo) %>%
+  unique() %>%
+  group_by(haplo) %>%
+  tally() %>%
+  mutate(freq = n/20) %>% # change this to be based on number of sampling locations -- not the sum 
+  ggplot(aes(x = reorder(haplo, -freq), y = freq, fill = reorder(haplo, -freq))) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(
+    axis.title.y = element_text(margin = margin(r = 5)),
+    axis.title.x = element_text(margin = margin(t = 5)),
+    legend.position = "bottom"
+  ) +
+  labs(
+    x = "eDNA haplotypes",
+    y = "frequency",
+    fill = "eDNA haplotypes",
+    title = "2025 eDNA samples, 20% read depth filter"
+  ) +
+  scale_fill_manual(values = pal21, na.value = "grey90") +
+  scale_y_continuous(expand = c(0,0))
+  
+
+ggsave("pdf_outputs/2025_samples_overall_freq_occur_20perc.png", width = 7, height = 4.5)
+```
+
+
