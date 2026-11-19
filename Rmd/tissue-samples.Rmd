@@ -202,13 +202,13 @@ head(track)
 ## Export files for taxonomy and samples/ASVs
 
 ```{r regseqs-asv-output}
- #make fasta file with ASVs
-    asv_seqs=colnames(seqtab.nochim)
-    for(i in 1:length(asv_seqs))
-    {
-        write.table(paste(">ASV",i, sep=""),file="csv_outputs/hapo_20260522_ASV.csv", append=TRUE, col.names = F, row.names = F, quote=F)
-        write.table(paste(asv_seqs[i], sep=""),file="csv_outputs/hapo_20260522_ASV.csv", append=TRUE, col.names = F, row.names = F, quote=F)
-    }
+ # #make fasta file with ASVs
+ #    asv_seqs=colnames(seqtab.nochim)
+ #    for(i in 1:length(asv_seqs))
+ #    {
+ #        write.table(paste(">ASV",i, sep=""),file="csv_outputs/hapo_20260522_ASV.csv", append=TRUE, col.names = F, row.names = F, quote=F)
+ #        write.table(paste(asv_seqs[i], sep=""),file="csv_outputs/hapo_20260522_ASV.csv", append=TRUE, col.names = F, row.names = F, quote=F)
+ #    }
 ```
 
 That's the input for the FASTA blastn search.
@@ -223,7 +223,7 @@ st.brief <- seqtab.nochim
 colnames(st.brief) <- names(briefToSeq)
 
 # export the pool seq table with brief names:
-write.csv(st.brief, file="csv_outputs/hapo_20260522_sampleTable.csv")
+#write.csv(st.brief, file="csv_outputs/hapo_20260522_sampleTable.csv")
 ```
 
 
@@ -438,6 +438,37 @@ asv_prop_df %>%
 ggsave("pdf_outputs/tissue_CR_100perc_matches.png", width = 8, height = 5)
 ```
 There are size samples for which the dominant ASV matched two control region haplotypes at the same percent identity and then there are two samples for which the ASV didn't match any control regions with fewer than 3 mismatches.
+
+
+```{r}
+# add location information for those tissue samples
+loc_info <- readxl::read_xlsx("../data/HAPO tissue locations.xlsx", sheet = "Sheet2") 
+asv_prop_df %>%
+  filter(prop_reads > 0.75) %>%
+  filter(!str_detect(sample, "-2")) %>%
+  left_join(., cr_hits) %>%
+  select(-evalue, -bitscore) %>%
+  unique() %>%
+  left_join(., loc_info, by = c("sample" = "ID")) %>%
+  ggplot() +
+  geom_tile(aes(x = sample, y = CR, fill = CR)) +
+  facet_grid(cols = vars(`General location to match Parsons 2025`), scales = "free", space = "free") +
+  theme_bw() +
+  theme(
+    #legend.position = "none",
+    axis.text.x = element_text(angle = 90, size = 6),
+    legend.position = "none",
+    strip.text = element_text(size = 6)
+  ) +
+  #scale_y_continuous(expand = c(0,0)) +
+  labs(
+    title = "tissue samples, 100% matches to control region haplotypes",
+    x = "sample"
+  )
+
+ggsave("pdf_outputs/tisue_samples_location_haps.png", width = 8, height = 5)
+```
+
 
 What was the original ASV matches for those four samples/ASVs?
 ```{r}

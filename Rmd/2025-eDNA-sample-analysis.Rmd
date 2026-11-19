@@ -396,3 +396,52 @@ ggsave("pdf_outputs/2025_samples_overall_freq_occur_20perc.png", width = 7, heig
 ```
 
 
+For the novel ASVs that were retained post-filtering, look at their presence in other samples (below the 20% threshold).
+
+```{r}
+edna_unfiltered_df %>%
+  filter(sample_type == "sample") %>%
+  group_by(sample) %>%
+  mutate(read_prop = reads/sum(reads)) %>%
+  unite(col = "sampling_loc", c(latitude, longitude)) %>%
+  filter(ASV %in% c("ASV12", "ASV5", "ASV56", "ASV65")) %>%
+  ggplot(aes(x = alternative_ID, y = read_prop, fill = ASV)) +
+  geom_bar(stat = "identity") +
+  facet_grid(rows = vars(replicate), cols = vars(sampling_loc), scales = "free", space = "free") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.9, vjust = 0.5),
+    axis.title.y = element_text(margin = margin(r = 5)),
+    axis.title.x = element_text(margin = margin(t = 5)),
+    strip.text = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    y = "proportion of sequencing reads",
+    x = "sample replictes",
+    fill = "haplotype",
+    title = "2025 eDNA samples, unfiltered\nCR with 100% matches"
+  ) +
+    #scale_fill_manual(values = pal21, na.value = "grey90") +
+  scale_y_continuous(expand = c(0,0))
+
+```
+
+ASV12 shows up in other other sample 
+
+```{r cumulative-reads?}
+edna_unfiltered_df %>%
+  filter(sample_type == "sample") %>%
+  group_by(sample) %>%
+  mutate(read_prop = reads/sum(reads)) %>%
+  unite(col = "sampling_loc", c(latitude, longitude)) %>%
+  filter(ASV %in% c("ASV12", "ASV5", "ASV56", "ASV65")) %>%
+  group_by(ASV) %>%
+  summarise(sum(reads))
+
+
+```
+
+yeah, so based on that I'd feel comfortable with ASV12 and ASV5, but not with ASV56 or ASV65.
+
+

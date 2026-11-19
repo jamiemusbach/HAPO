@@ -160,8 +160,6 @@ dim(seqtab)
 table(nchar(getSequences(seqtab)))
 ```
 
-
-
 Let's remove the singletons and off-target sequences
 ```{r}
 # this seems like the obvious size range
